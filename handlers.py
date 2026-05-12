@@ -238,21 +238,27 @@ async def category_callback(callback: types.CallbackQuery):
 
 @router.callback_query(F.data.startswith("content:preview:"))
 async def content_preview_callback(callback: types.CallbackQuery):
+    """
+    Оптимизировано: один запрос вместо трех (get_content_by_id + get_user_by_telegram + has_purchased).
+    """
     content_id = int(callback.data.split(":")[2])
-    content = await db.get_content_by_id(content_id)
-    if not content:
-        await callback.answer("Контент не найден", show_alert=True)
-        return
     user = await db.get_user_by_telegram(callback.from_user.id)
     if not user:
         await callback.answer("Пользователь не найден", show_alert=True)
         return
-    has_purchased = await db.has_purchased(user['id'], content_id)
+    
+    # Один запрос: получаем контент + статус покупки
+    content = await db.get_content_with_purchase_status(content_id, user['id'])
+    if not content:
+        await callback.answer("Контент не найден", show_alert=True)
+        return
+    
     text = f"📌 {content['title']}\n\n{content['description'] or 'Описание отсутствует'}\n\n💰 Цена: {content['price']}⭐️"
     # Получаем telegram_file_id из списка files
     telegram_file_id = None
     if content.get('files') and len(content['files']) > 0:
         telegram_file_id = content['files'][0].get('telegram_file_id')
+    
     if content['type'] == 'training_video' and telegram_file_id:
         try:
             await callback.message.answer_video(telegram_file_id, caption=text)
@@ -266,13 +272,23 @@ async def content_preview_callback(callback: types.CallbackQuery):
 
 @router.callback_query(F.data.startswith("content:view:"))
 async def content_view_callback(callback: types.CallbackQuery):
+    """
+    Оптимизировано: один запрос вместо трех (get_content_by_id + get_user_by_telegram + has_purchased).
+    """
     content_id = int(callback.data.split(":")[2])
-    content = await db.get_content_by_id(content_id)
+    user = await db.get_user_by_telegram(callback.from_user.id)
+    if not user:
+        await callback.answer("Пользователь не найден", show_alert=True)
+        return
+    
+    # Один запрос: получаем контент + статус покупки
+    content = await db.get_content_with_purchase_status(content_id, user['id'])
     if not content:
         await callback.answer("Контент не найден", show_alert=True)
         return
-    user = await db.get_user_by_telegram(callback.from_user.id)
-    has_purchased = await db.has_purchased(user['id'], content_id)
+    
+    has_purchased = content.get('has_purchased', False)
+    
     if content['is_paid'] and not has_purchased:
         await callback.message.edit_text(
             f"📌 {content['title']}\n\n{content['description'] or ''}\n\n💰 Цена: {content['price']}⭐️",
@@ -503,6 +519,14 @@ async def admin_file_handler(message: types.Message, state: FSMContext):
         if file_size > MAX_FILE_SIZE:
             await message.answer(f"❌ Видео слишком большое (макс. 50 МБ). Ваш размер: {file_size/1024/1024:.1f} МБ")
             return
+        # Проверяем разрешение видео (опционально, для оптимизации)
+        if message.video.width and message.video.height:
+            # Предупреждаем о очень высоком разрешении (может быть тяжелым для просмотра)
+            if message.video.width * message.video.height > 1920 * 1080:  # больше Full HD
+                await message.answer(
+                    f"⚠️ Видео имеет высокое разрешение ({message.video.width}x{message.video.height}). "
+                    f"Рекомендуется загружать видео не более 1920x1080 для быстрой загрузки."
+                )
     elif message.document:
         telegram_file_id = message.document.file_id
         file_type = 'document'

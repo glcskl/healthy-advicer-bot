@@ -334,6 +334,42 @@ async def get_content_by_filters_with_purchase_status(
     return result
 
 
+async def get_content_with_purchase_status(content_id: int, user_id: int) -> Optional[Dict]:
+    """
+    Получает контент по ID со статусом покупки пользователя.
+    Один запрос вместо двух (get_content_by_id + has_purchased).
+    """
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT
+                c.*,
+                CASE
+                    WHEN p.user_id IS NOT NULL AND (pay.status = 'succeeded' OR pay.payment_id IS NULL)
+                    THEN true
+                    ELSE false
+                END as has_purchased
+            FROM content c
+            LEFT JOIN purchases p ON c.id = p.content_id AND p.user_id = $2
+            LEFT JOIN payments pay ON p.payment_id = pay.id
+            WHERE c.id = $1
+            """,
+            content_id, user_id
+        )
+        if not row:
+            return None
+        
+        result = dict(row)
+        # Получаем файлы отдельным запросом (они редко меняются)
+        files = await conn.fetch(
+            "SELECT * FROM content_files WHERE content_id = $1 ORDER BY sort_order",
+            content_id
+        )
+        result['files'] = [dict(f) for f in files]
+        return result
+
+
 async def get_all_content_with_details(limit: int = 50, offset: int = 0) -> List[Dict]:
     """
     Оптимизированный запрос для админ-панели с пагинацией.
@@ -374,14 +410,6 @@ async def get_content_count_by_type(content_type: str = None) -> int:
 
 # ==================== CATEGORY CACHING ====================
 
-@lru_cache(maxsize=128)
-def _get_cached_categories(cache_key: str) -> List[Dict]:
-    """Внутренняя кэширующая функция (синхронная)"""
-    # Эта функция будет вызываться из асинхронного контекста
-    # Результат кэшируется в памяти процесса
-    pass  # Заглушка, реальная реализация ниже
-
-
 async def get_content_categories_cached(content_type: str, use_cache: bool = True) -> List[Dict]:
     """
     Кэшированный запрос категорий (TTL 5 минут).
@@ -414,6 +442,7 @@ async def get_content_categories_cached(content_type: str, use_cache: bool = Tru
 async def invalidate_category_cache():
     """Инвалидировать кэш категорий (вызывать после изменения категорий)"""
     _cache.clear()
+    logger.info("Category cache invalidated")
 
 
 async def delete_content(content_id: int) -> bool:
@@ -472,21 +501,20 @@ async def add_purchase(user_id: int, content_id: int, payment_id: int = None) ->
 
 
 async def has_purchased(user_id: int, content_id: int) -> bool:
+    """
+    Оптимизировано: один запрос вместо двух.
+    Проверяет, купил ли пользователь контент (учитывает как платные, так и бесплатные покупки).
+    """
     pool = await get_pool()
     async with pool.acquire() as conn:
         result = await conn.fetchrow(
             """SELECT p.id FROM purchases p
-               JOIN payments pay ON p.payment_id = pay.id
-               WHERE p.user_id = $1 AND p.content_id = $2 AND pay.status = 'succeeded'""",
+               LEFT JOIN payments pay ON p.payment_id = pay.id
+               WHERE p.user_id = $1 AND p.content_id = $2
+               AND (pay.status = 'succeeded' OR pay.payment_id IS NULL)""",
             user_id, content_id
         )
-        if result:
-            return True
-        result2 = await conn.fetchrow(
-            "SELECT id FROM purchases WHERE user_id = $1 AND content_id = $2 AND payment_id IS NULL",
-            user_id, content_id
-        )
-        return result2 is not None
+        return result is not None
 
 
 async def get_content_categories(content_type: str) -> List[Dict]:
@@ -553,10 +581,12 @@ async def add_category(name: str, display_name: str, type_filter: List[str], sor
     pool = await get_pool()
     async with pool.acquire() as conn:
         category_id = await conn.fetchval(
-            """INSERT INTO categories (name, display_name, type_filter, sort_order) 
+            """INSERT INTO categories (name, display_name, type_filter, sort_order)
                VALUES ($1, $2, $3, $4) RETURNING id""",
             name, display_name, type_filter, sort_order
         )
+    # Инвалидируем кэш категорий после добавления
+    await invalidate_category_cache()
     return category_id or 0
 
 
@@ -565,6 +595,56 @@ async def get_category_by_id(category_id: int) -> Optional[Dict]:
     async with pool.acquire() as conn:
         category = await conn.fetchrow("SELECT * FROM categories WHERE id = $1", category_id)
     return dict(category) if category else None
+
+
+async def update_category(category_id: int, name: str = None, display_name: str = None,
+                         type_filter: List[str] = None, sort_order: int = None) -> bool:
+    """
+    Обновляет категорию и инвалидирует кэш.
+    Возвращает True если категория была обновлена.
+    """
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        updates = []
+        params = []
+        if name is not None:
+            updates.append(f"name = ${len(params) + 1}")
+            params.append(name)
+        if display_name is not None:
+            updates.append(f"display_name = ${len(params) + 1}")
+            params.append(display_name)
+        if type_filter is not None:
+            updates.append(f"type_filter = ${len(params) + 1}")
+            params.append(type_filter)
+        if sort_order is not None:
+            updates.append(f"sort_order = ${len(params) + 1}")
+            params.append(sort_order)
+        
+        if not updates:
+            return False
+        
+        params.append(category_id)
+        query = f"UPDATE categories SET {', '.join(updates)} WHERE id = ${len(params)}"
+        result = await conn.execute(query, *params)
+        
+        if "UPDATE" in result:
+            await invalidate_category_cache()
+            return True
+        return False
+
+
+async def delete_category(category_id: int) -> bool:
+    """
+    Удаляет категорию и инвалидирует кэш.
+    Возвращает True если категория была удалена.
+    """
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        result = await conn.execute("DELETE FROM categories WHERE id = $1", category_id)
+        if "DELETE" in result:
+            await invalidate_category_cache()
+            return True
+        return False
 
 
 async def get_migration_status() -> Dict:

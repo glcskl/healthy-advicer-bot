@@ -190,6 +190,8 @@ CREATE INDEX IF NOT EXISTS idx_purchases_user_id ON purchases(user_id);
 CREATE INDEX IF NOT EXISTS idx_purchases_content_id ON purchases(content_id);
 CREATE INDEX IF NOT EXISTS idx_purchases_payment_id ON purchases(payment_id);
 CREATE INDEX IF NOT EXISTS idx_purchases_user_content ON purchases(user_id, content_id);
+-- Composite index for optimized JOIN queries (content_id + user_id)
+CREATE INDEX IF NOT EXISTS idx_purchases_content_user ON purchases(content_id, user_id);
 
 -- =============================================
 -- View: active_purchases
