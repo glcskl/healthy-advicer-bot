@@ -8,12 +8,14 @@ from pathlib import Path
 import aiofiles
 from functools import lru_cache
 import time
+import traceback
 
 logger = logging.getLogger(__name__)
 
 _pool: Optional[asyncpg.Pool] = None
 _cache: Dict[str, Tuple[any, float]] = {}  # Простой кэш: ключ -> (значение, timestamp)
 _CACHE_TTL = 300  # 5 минут в секундах
+_SLOW_QUERY_THRESHOLD = 0.5  # Логировать запросы дольше 500 мс
 
 
 async def init_db_pool():
@@ -56,6 +58,45 @@ async def get_pool() -> asyncpg.Pool:
     if _pool is None:
         raise RuntimeError("Database pool is not initialized. Call init_db_pool() first.")
     return _pool
+
+
+async def execute_with_timing(query: str, *args, fetch_type: str = 'fetch'):
+    """
+    Выполняет запрос с измерением времени и логирует медленные запросы.
+    fetch_type: 'fetch', 'fetchrow', 'fetchval', 'execute'
+    """
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        start_time = time.time()
+        try:
+            if fetch_type == 'fetch':
+                result = await conn.fetch(query, *args)
+            elif fetch_type == 'fetchrow':
+                result = await conn.fetchrow(query, *args)
+            elif fetch_type == 'fetchval':
+                result = await conn.fetchval(query, *args)
+            elif fetch_type == 'execute':
+                result = await conn.execute(query, *args)
+            else:
+                raise ValueError(f"Unknown fetch_type: {fetch_type}")
+
+            elapsed = time.time() - start_time
+
+            # Логируем медленные запросы
+            if elapsed > _SLOW_QUERY_THRESHOLD:
+                logger.warning(
+                    f"Slow query detected ({elapsed:.3f}s): {query[:100]}... "
+                    f"args={args[:3] if args else 'none'}"
+                )
+
+            return result
+        except Exception as e:
+            elapsed = time.time() - start_time
+            logger.error(
+                f"Query failed after {elapsed:.3f}s: {query[:100]}... "
+                f"Error: {e}"
+            )
+            raise
 
 
 async def ensure_migrations_table(conn: asyncpg.Connection):
@@ -154,44 +195,67 @@ async def init_db():
 async def register_user(telegram_id: int, username: Optional[str] = None) -> Optional[Dict]:
     pool = await get_pool()
     async with pool.acquire() as conn:
-        user = await conn.fetchrow("SELECT * FROM users WHERE telegram_id = $1", telegram_id)
+        user = await execute_with_timing(
+            "SELECT * FROM users WHERE telegram_id = $1",
+            telegram_id,
+            fetch_type='fetchrow'
+        )
 
         if not user:
             role = 'admin' if telegram_id in ADMIN_IDS else 'user'
-            await conn.execute(
+            await execute_with_timing(
                 "INSERT INTO users (telegram_id, username, role) VALUES ($1, $2, $3)",
-                telegram_id, username, role
+                telegram_id, username, role,
+                fetch_type='execute'
             )
-            user = await conn.fetchrow("SELECT * FROM users WHERE telegram_id = $1", telegram_id)
+            user = await execute_with_timing(
+                "SELECT * FROM users WHERE telegram_id = $1",
+                telegram_id,
+                fetch_type='fetchrow'
+            )
         else:
-            await conn.execute(
+            await execute_with_timing(
                 "UPDATE users SET last_active_at = CURRENT_TIMESTAMP WHERE id = $1",
-                user['id']
+                user['id'],
+                fetch_type='execute'
             )
-            user = await conn.fetchrow("SELECT * FROM users WHERE telegram_id = $1", telegram_id)
+            user = await execute_with_timing(
+                "SELECT * FROM users WHERE telegram_id = $1",
+                telegram_id,
+                fetch_type='fetchrow'
+            )
     return dict(user) if user else None
 
 
 async def get_user_by_telegram(telegram_id: int) -> Optional[Dict]:
     pool = await get_pool()
     async with pool.acquire() as conn:
-        user = await conn.fetchrow("SELECT * FROM users WHERE telegram_id = $1", telegram_id)
+        user = await execute_with_timing(
+            "SELECT * FROM users WHERE telegram_id = $1",
+            telegram_id,
+            fetch_type='fetchrow'
+        )
     return dict(user) if user else None
 
 
 async def get_user_by_id(user_id: int) -> Optional[Dict]:
     pool = await get_pool()
     async with pool.acquire() as conn:
-        user = await conn.fetchrow("SELECT * FROM users WHERE id = $1", user_id)
+        user = await execute_with_timing(
+            "SELECT * FROM users WHERE id = $1",
+            user_id,
+            fetch_type='fetchrow'
+        )
     return dict(user) if user else None
 
 
 async def update_user_active(telegram_id: int):
     pool = await get_pool()
     async with pool.acquire() as conn:
-        await conn.execute(
+        await execute_with_timing(
             "UPDATE users SET last_active_at = CURRENT_TIMESTAMP WHERE telegram_id = $1",
-            telegram_id
+            telegram_id,
+            fetch_type='execute'
         )
 
 
@@ -204,14 +268,19 @@ async def add_content(content_type: str, title: str, description: str,
                       price: int, category_name: str) -> int:
     pool = await get_pool()
     async with pool.acquire() as conn:
-        category = await conn.fetchrow("SELECT id FROM categories WHERE name = $1", category_name)
+        category = await execute_with_timing(
+            "SELECT id FROM categories WHERE name = $1",
+            category_name,
+            fetch_type='fetchrow'
+        )
         if not category:
             raise ValueError(f"Category '{category_name}' not found")
 
-        content_id = await conn.fetchval(
-            """INSERT INTO content (type, title, description, price, category_id) 
+        content_id = await execute_with_timing(
+            """INSERT INTO content (type, title, description, price, category_id)
                VALUES ($1, $2, $3, $4, $5) RETURNING id""",
-            content_type, title, description, price, category['id']
+            content_type, title, description, price, category['id'],
+            fetch_type='fetchval'
         )
     return content_id or 0
 
@@ -220,10 +289,11 @@ async def add_content_file(content_id: int, telegram_file_id: str, file_type: st
                            file_name: str = None, file_size: int = None, mime_type: str = None) -> int:
     pool = await get_pool()
     async with pool.acquire() as conn:
-        file_id = await conn.fetchval(
-            """INSERT INTO content_files (content_id, telegram_file_id, file_type, file_name, file_size, mime_type) 
+        file_id = await execute_with_timing(
+            """INSERT INTO content_files (content_id, telegram_file_id, file_type, file_name, file_size, mime_type)
                VALUES ($1, $2, $3, $4, $5, $6) RETURNING id""",
-            content_id, telegram_file_id, file_type, file_name, file_size, mime_type
+            content_id, telegram_file_id, file_type, file_name, file_size, mime_type,
+            fetch_type='fetchval'
         )
     return file_id or 0
 
@@ -231,11 +301,16 @@ async def add_content_file(content_id: int, telegram_file_id: str, file_type: st
 async def get_content_by_id(content_id: int) -> Optional[Dict]:
     pool = await get_pool()
     async with pool.acquire() as conn:
-        content = await conn.fetchrow("SELECT * FROM content WHERE id = $1", content_id)
+        content = await execute_with_timing(
+            "SELECT * FROM content WHERE id = $1",
+            content_id,
+            fetch_type='fetchrow'
+        )
         if content:
-            files = await conn.fetch(
-                "SELECT * FROM content_files WHERE content_id = $1 ORDER BY sort_order", 
-                content_id
+            files = await execute_with_timing(
+                "SELECT * FROM content_files WHERE content_id = $1 ORDER BY sort_order",
+                content_id,
+                fetch_type='fetch'
             )
             result = dict(content)
             result['files'] = [dict(f) for f in files]
@@ -247,31 +322,46 @@ async def get_content_by_filters(content_type: str, category_name: str = None) -
     pool = await get_pool()
     async with pool.acquire() as conn:
         if category_name:
-            rows = await conn.fetch("""
+            rows = await execute_with_timing("""
                 SELECT c.* FROM content c
                 JOIN categories cat ON c.category_id = cat.id
                 WHERE c.type = $1 AND cat.name = $2
                 ORDER BY c.created_at DESC
-            """, content_type, category_name)
+            """, content_type, category_name, fetch_type='fetch')
         else:
-            rows = await conn.fetch("SELECT * FROM content WHERE type = $1 ORDER BY created_at DESC", content_type)
+            rows = await execute_with_timing(
+                "SELECT * FROM content WHERE type = $1 ORDER BY created_at DESC",
+                content_type,
+                fetch_type='fetch'
+            )
     return [dict(row) for row in rows]
 
 
 async def get_all_content() -> List[Dict]:
     pool = await get_pool()
     async with pool.acquire() as conn:
-        rows = await conn.fetch("SELECT * FROM content ORDER BY id DESC")
+        rows = await execute_with_timing(
+            "SELECT * FROM content ORDER BY id DESC",
+            fetch_type='fetch'
+        )
     return [dict(row) for row in rows]
 
 
 async def get_content_with_files(content_id: int) -> Optional[Dict]:
     pool = await get_pool()
     async with pool.acquire() as conn:
-        content = await conn.fetchrow("SELECT * FROM content WHERE id = $1", content_id)
+        content = await execute_with_timing(
+            "SELECT * FROM content WHERE id = $1",
+            content_id,
+            fetch_type='fetchrow'
+        )
         if not content:
             return None
-        files = await conn.fetch("SELECT * FROM content_files WHERE content_id = $1 ORDER BY sort_order", content_id)
+        files = await execute_with_timing(
+            "SELECT * FROM content_files WHERE content_id = $1 ORDER BY sort_order",
+            content_id,
+            fetch_type='fetch'
+        )
         result = dict(content)
         result['files'] = [dict(f) for f in files]
         return result
